@@ -23,3 +23,11 @@ go.work.sum
 
 # env file
 .env
+
+# Database files
+*.db
+*.db-*
+
+# Frontend dependencies
+node_modules/
+dashboard/node_modules/

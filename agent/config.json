@@ -1,0 +1,6 @@
+{
+  "server_url": "http://localhost:8080",
+  "server_token": "srv_dev_local_test",
+  "server_name": "Development Local Server",
+  "interval_sec": 5
+}
