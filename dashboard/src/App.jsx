@@ -31,7 +31,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [lastRefreshed, setLastRefreshed] = useState(new Date());
 
-  const consoleEndRef = useRef(null);
+  const terminalConsoleRef = useRef(null);
 
   // Fetch servers list
   const fetchServers = async () => {
@@ -137,10 +137,10 @@ function App() {
     }
   }, [metrics]);
 
-  // Auto-scroll terminal console to bottom
+  // Auto-scroll terminal console internally without jumping main viewport
   useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (terminalConsoleRef.current) {
+      terminalConsoleRef.current.scrollTop = terminalConsoleRef.current.scrollHeight;
     }
   }, [accumulatedLogs]);
 
@@ -293,7 +293,7 @@ function App() {
               cx={p.x} 
               cy={p.y} 
               r="3.5" 
-              fill={activeColor} 
+              fill={p.val > 90 ? 'var(--color-alert)' : activeColor} 
               stroke="var(--bg-card)" 
               strokeWidth="1.5" 
             />
@@ -326,7 +326,9 @@ function App() {
           />
         </svg>
         <div className="metric-value-label">
-          <span className="metric-number">{percent.toFixed(1)}</span>
+          <span className="metric-number" style={{ color: percent > 90 ? 'var(--color-alert)' : 'var(--text-primary)' }}>
+            {percent.toFixed(1)}
+          </span>
           <span className="metric-unit">%</span>
         </div>
       </div>
@@ -540,7 +542,7 @@ function App() {
                   </div>
 
                   {/* DevOps Network & Disk Throughput Grid */}
-                  <div className="metrics-card-grid" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '24px' }}>
+                  <div className="metrics-card-grid" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '28px' }}>
                     <div className="metric-card" style={{ padding: '20px 24px' }}>
                       <div className="metric-card-header" style={{ marginBottom: '14px' }}>
                         <span className="metric-title" style={{ fontSize: '14px' }}>
@@ -558,7 +560,7 @@ function App() {
                           </div>
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                          <div style={{ backgroundColor: 'rgba(168, 85, 247, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-ram)' }}>
+                          <div style={{ backgroundColor: 'rgba(217, 70, 239, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-ram)' }}>
                             <ArrowUpRight size={20} />
                           </div>
                           <div>
@@ -755,7 +757,7 @@ function App() {
                         <div className="terminal-dot green" />
                       </div>
                     </header>
-                    <div className="terminal-console">
+                    <div className="terminal-console" ref={terminalConsoleRef}>
                       {accumulatedLogs.length === 0 ? (
                         <div style={{ color: 'var(--text-muted)', fontStyle: 'italic', padding: '10px 0' }}>
                           Waiting for application log lines... Make sure log file exists and is populated.
@@ -774,7 +776,6 @@ function App() {
                           </div>
                         ))
                       )}
-                      <div ref={consoleEndRef} />
                     </div>
                   </div>
 
