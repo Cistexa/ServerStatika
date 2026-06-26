@@ -41,11 +41,33 @@ type ProcessInfo struct {
 	RAM  float64 `json:"ram"`
 }
 
+type DockerContainer struct {
+	ID      string `json:"id"`
+	Names   string `json:"names"`
+	Image   string `json:"image"`
+	State   string `json:"state"`
+	Status  string `json:"status"`
+}
+
+type LogEntry struct {
+	Timestamp string `json:"timestamp"`
+	Level     string `json:"level"` // "info", "warn", "error"
+	Source    string `json:"source"`
+	Message   string `json:"message"`
+}
+
 type MetricData struct {
-	CPUUsagePercent float64       `json:"cpu_usage_percent"`
-	RAM             RAMInfo       `json:"ram"`
-	Disk            DiskInfo      `json:"disk"`
-	TopProcesses    []ProcessInfo `json:"top_processes"`
+	CPUUsagePercent  float64            `json:"cpu_usage_percent"`
+	RAM              RAMInfo            `json:"ram"`
+	Disk             DiskInfo           `json:"disk"`
+	TopProcesses     []ProcessInfo      `json:"top_processes"`
+	NetSentBytesSec  float64            `json:"net_sent_bytes_sec"`
+	NetRecvBytesSec  float64            `json:"net_recv_bytes_sec"`
+	DiskReadBytesSec float64            `json:"disk_read_bytes_sec"`
+	DiskWriteBytesSec float64           `json:"disk_write_bytes_sec"`
+	Services         map[string]string  `json:"services"` // e.g. {"Nginx": "active", "Postgres": "inactive"}
+	DockerContainers []DockerContainer  `json:"docker_containers"`
+	Logs             []LogEntry         `json:"logs"`
 }
 
 type MetricRecord struct {
@@ -97,6 +119,13 @@ func InitDB(dbPath string) error {
 			disk_used INTEGER NOT NULL,
 			disk_percent REAL NOT NULL,
 			top_processes TEXT,
+			net_sent_bytes_sec REAL DEFAULT 0,
+			net_recv_bytes_sec REAL DEFAULT 0,
+			disk_read_bytes_sec REAL DEFAULT 0,
+			disk_write_bytes_sec REAL DEFAULT 0,
+			services TEXT,
+			docker_containers TEXT,
+			logs TEXT,
 			FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
 		);`,
 		`CREATE TABLE IF NOT EXISTS alerts (
@@ -169,9 +198,27 @@ func SaveMetrics(serverID string, m MetricData) error {
 	}
 
 	// Serialize processes to JSON string
-	procJSON, err := json.Marshal(m.TopProcesses)
-	if err != nil {
+	procJSON, _ := json.Marshal(m.TopProcesses)
+	if len(m.TopProcesses) == 0 {
 		procJSON = []byte("[]")
+	}
+
+	// Serialize services map
+	servicesJSON, _ := json.Marshal(m.Services)
+	if m.Services == nil {
+		servicesJSON = []byte("{}")
+	}
+
+	// Serialize docker containers
+	containersJSON, _ := json.Marshal(m.DockerContainers)
+	if len(m.DockerContainers) == 0 {
+		containersJSON = []byte("[]")
+	}
+
+	// Serialize logs
+	logsJSON, _ := json.Marshal(m.Logs)
+	if len(m.Logs) == 0 {
+		logsJSON = []byte("[]")
 	}
 
 	// 2. Insert metric record
@@ -180,12 +227,16 @@ func SaveMetrics(serverID string, m MetricData) error {
 			server_id, timestamp, cpu_usage, 
 			ram_total, ram_used, ram_percent, 
 			disk_total, disk_used, disk_percent, 
-			top_processes
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			top_processes, net_sent_bytes_sec, net_recv_bytes_sec,
+			disk_read_bytes_sec, disk_write_bytes_sec, services,
+			docker_containers, logs
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, serverID, now, m.CPUUsagePercent,
 		m.RAM.TotalMB, m.RAM.UsedMB, m.RAM.Percent,
 		m.Disk.TotalGB, m.Disk.UsedGB, m.Disk.Percent,
-		string(procJSON))
+		string(procJSON), m.NetSentBytesSec, m.NetRecvBytesSec,
+		m.DiskReadBytesSec, m.DiskWriteBytesSec, string(servicesJSON),
+		string(containersJSON), string(logsJSON))
 
 	if err != nil {
 		return fmt.Errorf("failed to save metrics: %w", err)
@@ -237,7 +288,9 @@ func GetServerMetrics(serverID string, limit int) ([]MetricRecord, error) {
 		SELECT id, timestamp, cpu_usage, 
 		       ram_total, ram_used, ram_percent, 
 		       disk_total, disk_used, disk_percent, 
-		       top_processes 
+		       top_processes, net_sent_bytes_sec, net_recv_bytes_sec,
+		       disk_read_bytes_sec, disk_write_bytes_sec, services,
+		       docker_containers, logs
 		FROM metrics 
 		WHERE server_id = ? 
 		ORDER BY timestamp DESC 
@@ -253,12 +306,14 @@ func GetServerMetrics(serverID string, limit int) ([]MetricRecord, error) {
 		var mr MetricRecord
 		mr.ServerID = serverID
 		var tsStr string
-		var topProcStr string
+		var topProcStr, servicesStr, containersStr, logsStr string
 		if err := rows.Scan(
 			&mr.ID, &tsStr, &mr.Metrics.CPUUsagePercent,
 			&mr.Metrics.RAM.TotalMB, &mr.Metrics.RAM.UsedMB, &mr.Metrics.RAM.Percent,
 			&mr.Metrics.Disk.TotalGB, &mr.Metrics.Disk.UsedGB, &mr.Metrics.Disk.Percent,
-			&topProcStr,
+			&topProcStr, &mr.Metrics.NetSentBytesSec, &mr.Metrics.NetRecvBytesSec,
+			&mr.Metrics.DiskReadBytesSec, &mr.Metrics.DiskWriteBytesSec, &servicesStr,
+			&containersStr, &logsStr,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan metrics: %w", err)
 		}
@@ -270,11 +325,33 @@ func GetServerMetrics(serverID string, limit int) ([]MetricRecord, error) {
 			mr.Timestamp, _ = time.Parse("2006-01-02 15:04:05", tsStr)
 		}
 
+		// Deserializations
 		var procs []ProcessInfo
 		if err := json.Unmarshal([]byte(topProcStr), &procs); err == nil {
 			mr.Metrics.TopProcesses = procs
 		} else {
 			mr.Metrics.TopProcesses = []ProcessInfo{}
+		}
+
+		var svcs map[string]string
+		if err := json.Unmarshal([]byte(servicesStr), &svcs); err == nil {
+			mr.Metrics.Services = svcs
+		} else {
+			mr.Metrics.Services = make(map[string]string)
+		}
+
+		var conts []DockerContainer
+		if err := json.Unmarshal([]byte(containersStr), &conts); err == nil {
+			mr.Metrics.DockerContainers = conts
+		} else {
+			mr.Metrics.DockerContainers = []DockerContainer{}
+		}
+
+		var logs []LogEntry
+		if err := json.Unmarshal([]byte(logsStr), &logs); err == nil {
+			mr.Metrics.Logs = logs
+		} else {
+			mr.Metrics.Logs = []LogEntry{}
 		}
 
 		list = append(list, mr)

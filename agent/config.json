@@ -2,5 +2,14 @@
   "server_url": "http://localhost:8080",
   "server_token": "srv_dev_local_test",
   "server_name": "Development Local Server",
-  "interval_sec": 5
+  "interval_sec": 5,
+  "services": [
+    "ServerStatika Backend:8080",
+    "PostgreSQL Database:5432",
+    "Docker Registry:5000",
+    "Redis Cache:6379"
+  ],
+  "log_files": [
+    "c:/Users/cinar/Documents/GitHub/ServerStatika/backend/app.log"
+  ]
 }

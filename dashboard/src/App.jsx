@@ -10,7 +10,12 @@ import {
   Clock, 
   Terminal, 
   RefreshCw,
-  Info
+  Info,
+  ArrowDownLeft,
+  ArrowUpRight,
+  TrendingUp,
+  List,
+  Layers
 } from 'lucide-react';
 
 const API_BASE = window.location.port === '5173' ? 'http://localhost:8080' : '';
@@ -22,8 +27,11 @@ function App() {
   const [metrics, setMetrics] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [activeChartMetric, setActiveChartMetric] = useState('cpu'); // 'cpu' | 'ram' | 'disk'
+  const [accumulatedLogs, setAccumulatedLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lastRefreshed, setLastRefreshed] = useState(new Date());
+
+  const consoleEndRef = useRef(null);
 
   // Fetch servers list
   const fetchServers = async () => {
@@ -32,7 +40,6 @@ function App() {
       if (res.ok) {
         const data = await res.json();
         setServers(data || []);
-        // Set first server as selected if none is selected
         if (data && data.length > 0 && !selectedServerId) {
           setSelectedServerId(data[0].id);
         }
@@ -46,7 +53,7 @@ function App() {
   const fetchMetrics = async (serverId) => {
     if (!serverId) return;
     try {
-      const res = await fetch(`${API_BASE}/api/servers/${serverId}/metrics?limit=30`);
+      const res = await fetch(`${API_BASE}/api/servers/${serverId}/metrics?limit=40`);
       if (res.ok) {
         const data = await res.json();
         setMetrics(data || []);
@@ -89,7 +96,7 @@ function App() {
     return () => clearInterval(interval);
   }, [selectedServerId]);
 
-  // Fetch metrics when selected server changes or periodically
+  // Fetch metrics periodically
   useEffect(() => {
     fetchMetrics(selectedServerId);
     const interval = setInterval(() => {
@@ -97,6 +104,45 @@ function App() {
     }, 4000);
     return () => clearInterval(interval);
   }, [selectedServerId]);
+
+  // Accumulate logs from metrics history
+  useEffect(() => {
+    if (metrics && metrics.length > 0) {
+      const allLogs = [];
+      metrics.forEach(record => {
+        if (record.metrics.logs) {
+          record.metrics.logs.forEach(logLine => {
+            allLogs.push(logLine);
+          });
+        }
+      });
+
+      // Sort chronologically
+      allLogs.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+      // Deduplicate
+      const uniqueLogs = [];
+      const seen = new Set();
+      allLogs.forEach(logLine => {
+        const key = `${logLine.timestamp}-${logLine.message}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniqueLogs.push(logLine);
+        }
+      });
+
+      setAccumulatedLogs(uniqueLogs.slice(-150));
+    } else {
+      setAccumulatedLogs([]);
+    }
+  }, [metrics]);
+
+  // Auto-scroll terminal console to bottom
+  useEffect(() => {
+    if (consoleEndRef.current) {
+      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [accumulatedLogs]);
 
   // Selected server details
   const selectedServer = servers.find(s => s.id === selectedServerId);
@@ -108,13 +154,21 @@ function App() {
   const onlineServers = servers.filter(s => s.status === 'online').length;
   const activeAlerts = alerts.filter(a => !a.resolved_at).length;
 
+  // Bytes converter
+  const formatSpeed = (bytesSec) => {
+    if (bytesSec === undefined || bytesSec === null || isNaN(bytesSec)) return '0 B/s';
+    if (bytesSec < 1024) return `${bytesSec.toFixed(0)} B/s`;
+    if (bytesSec < 1024 * 1024) return `${(bytesSec / 1024).toFixed(1)} KB/s`;
+    return `${(bytesSec / (1024 * 1024)).toFixed(1)} MB/s`;
+  };
+
   // Custom SVG Chart Generator
   const renderSVGChart = () => {
     if (metrics.length === 0) {
       return (
         <div className="empty-state">
           <Info size={32} />
-          <p>No metrics history available. Ensure the agent is reporting.</p>
+          <p>No performance history available. Ensure the agent is reporting.</p>
         </div>
       );
     }
@@ -243,7 +297,6 @@ function App() {
               stroke="var(--bg-card)" 
               strokeWidth="1.5" 
             />
-            {/* Simple SVG tooltip on hover */}
             <title>{`${p.val.toFixed(1)}% at ${p.time}`}</title>
           </g>
         ))}
@@ -486,6 +539,65 @@ function App() {
                     </div>
                   </div>
 
+                  {/* DevOps Network & Disk Throughput Grid */}
+                  <div className="metrics-card-grid" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '24px' }}>
+                    <div className="metric-card" style={{ padding: '20px 24px' }}>
+                      <div className="metric-card-header" style={{ marginBottom: '14px' }}>
+                        <span className="metric-title" style={{ fontSize: '14px' }}>
+                          <TrendingUp size={16} color="var(--color-cpu)" /> Network Throughput
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', height: '80px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <div style={{ backgroundColor: 'rgba(6, 182, 212, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-cpu)' }}>
+                            <ArrowDownLeft size={20} />
+                          </div>
+                          <div>
+                            <div className="stat-label" style={{ fontSize: '10px' }}>Download (Rx)</div>
+                            <div className="speed-badge">{formatSpeed(latestMetrics.net_recv_bytes_sec)}</div>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <div style={{ backgroundColor: 'rgba(168, 85, 247, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-ram)' }}>
+                            <ArrowUpRight size={20} />
+                          </div>
+                          <div>
+                            <div className="stat-label" style={{ fontSize: '10px' }}>Upload (Tx)</div>
+                            <div className="speed-badge">{formatSpeed(latestMetrics.net_sent_bytes_sec)}</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="metric-card" style={{ padding: '20px 24px' }}>
+                      <div className="metric-card-header" style={{ marginBottom: '14px' }}>
+                        <span className="metric-title" style={{ fontSize: '14px' }}>
+                          <HardDrive size={16} color="var(--color-disk)" /> Disk Activity (Read/Write)
+                        </span>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', height: '80px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <div style={{ backgroundColor: 'rgba(16, 185, 129, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-disk)' }}>
+                            <ArrowDownLeft size={20} />
+                          </div>
+                          <div>
+                            <div className="stat-label" style={{ fontSize: '10px' }}>Read speed</div>
+                            <div className="speed-badge">{formatSpeed(latestMetrics.disk_read_bytes_sec)}</div>
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                          <div style={{ backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: '10px', borderRadius: '10px', color: 'var(--text-secondary)' }}>
+                            <ArrowUpRight size={20} />
+                          </div>
+                          <div>
+                            <div className="stat-label" style={{ fontSize: '10px' }}>Write speed</div>
+                            <div className="speed-badge">{formatSpeed(latestMetrics.disk_write_bytes_sec)}</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* SVG Charts & Processes Row */}
                   <div className="dashboard-details-row">
                     <div className="chart-card">
@@ -519,7 +631,7 @@ function App() {
 
                     <div className="processes-card">
                       <div className="processes-header">
-                        <span className="processes-title"><Terminal size={18} /> Top Processes</span>
+                        <span className="processes-title"><List size={18} /> Top Processes</span>
                       </div>
                       <table className="processes-table">
                         <thead>
@@ -551,6 +663,121 @@ function App() {
                       </table>
                     </div>
                   </div>
+
+                  {/* DevOps Services Statuses & Docker Containers */}
+                  <div className="dashboard-details-row" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '24px' }}>
+                    <div className="containers-card">
+                      <div className="processes-header" style={{ marginBottom: '10px' }}>
+                        <span className="processes-title">
+                          <Layers size={18} /> Docker Containers
+                        </span>
+                        {latestMetrics.docker_containers && (
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: '600' }}>
+                            {latestMetrics.docker_containers.length} active
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ overflowX: 'auto' }}>
+                        <table className="containers-table">
+                          <thead>
+                            <tr>
+                              <th>Name</th>
+                              <th>Image</th>
+                              <th>Status</th>
+                              <th>State</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {latestMetrics.docker_containers && latestMetrics.docker_containers.length > 0 ? (
+                              latestMetrics.docker_containers.map((c, idx) => (
+                                <tr key={idx}>
+                                  <td className="container-name">{c.names}</td>
+                                  <td className="container-image" title={c.image}>
+                                    {c.image.length > 20 ? c.image.substring(0, 20) + '...' : c.image}
+                                  </td>
+                                  <td style={{ fontSize: '11px' }}>{c.status}</td>
+                                  <td>
+                                    <span className={`container-state-badge ${c.state}`}>
+                                      {c.state}
+                                    </span>
+                                  </td>
+                                </tr>
+                              ))
+                            ) : (
+                              <tr>
+                                <td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px 0' }}>
+                                  No Docker containers running or daemon offline.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="processes-card" style={{ display: 'flex', flexDirection: 'column' }}>
+                      <div className="processes-header">
+                        <span className="processes-title">
+                          <CheckCircle size={18} /> Monitored Services Health
+                        </span>
+                      </div>
+                      <div style={{ flexGrow: 1, overflowY: 'auto' }}>
+                        {latestMetrics.services && Object.keys(latestMetrics.services).length > 0 ? (
+                          <div className="services-widget">
+                            {Object.entries(latestMetrics.services).map(([name, status]) => (
+                              <div className="service-status-card" key={name}>
+                                <span className="service-name">{name}</span>
+                                <span className={`service-status-badge ${status}`}>{status}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="empty-state" style={{ padding: '20px' }}>
+                            <Info size={24} />
+                            <p style={{ fontSize: '12px' }}>
+                              No port monitors configured in config.json.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* DevOps Live Log Terminal Console */}
+                  <div className="terminal-card">
+                    <header className="terminal-header">
+                      <span className="terminal-title">
+                        <Terminal size={18} color="var(--color-cpu)" /> Live Log Stream (File Tailer)
+                      </span>
+                      <div className="terminal-controls">
+                        <div className="terminal-dot red" />
+                        <div className="terminal-dot yellow" />
+                        <div className="terminal-dot green" />
+                      </div>
+                    </header>
+                    <div className="terminal-console">
+                      {accumulatedLogs.length === 0 ? (
+                        <div style={{ color: 'var(--text-muted)', fontStyle: 'italic', padding: '10px 0' }}>
+                          Waiting for application log lines... Make sure log file exists and is populated.
+                        </div>
+                      ) : (
+                        accumulatedLogs.map((logLine, idx) => (
+                          <div className="terminal-line" key={idx}>
+                            <span className="terminal-time">
+                              [{new Date(logLine.timestamp).toLocaleTimeString()}]
+                            </span>
+                            <span className="terminal-src">{logLine.source}</span>
+                            <span className={`terminal-level ${logLine.level}`}>
+                              {logLine.level}
+                            </span>
+                            <span className="terminal-msg">{logLine.message}</span>
+                          </div>
+                        ))
+                      )}
+                      <div ref={consoleEndRef} />
+                    </div>
+                  </div>
+
                 </>
               ) : (
                 <div className="empty-state" style={{ backgroundColor: 'var(--bg-card)', border: '1px solid var(--border-color)', borderRadius: '16px' }}>

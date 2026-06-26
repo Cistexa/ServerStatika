@@ -15,6 +15,13 @@ import (
 var frontendFS embed.FS
 
 func main() {
+	// Configure logging to stdout and app.log file
+	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		mw := io.MultiWriter(os.Stdout, logFile)
+		log.SetOutput(mw)
+	}
+
 	// Initialize database
 	dbPath := os.Getenv("DATABASE_PATH")
 	if dbPath == "" {

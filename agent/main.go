@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,15 +11,18 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
-	"github.com/shirou/gopsutil/v3/disk"
+	gopsdisk "github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
+	gopsnet "github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
 )
 
@@ -26,6 +31,8 @@ type Config struct {
 	ServerToken string        `json:"server_token"`
 	ServerName  string        `json:"server_name"`
 	IntervalSec time.Duration `json:"interval_sec"`
+	Services    []string      `json:"services"`  // e.g. ["Nginx:80", "Postgres:5432"]
+	LogFiles    []string      `json:"log_files"` // e.g. ["c:/Users/cinar/Documents/GitHub/ServerStatika/backend/app.log"]
 }
 
 type RAMInfo struct {
@@ -48,11 +55,33 @@ type ProcessInfo struct {
 	RAM  float64 `json:"ram"`
 }
 
+type DockerContainer struct {
+	ID     string `json:"id"`
+	Names  string `json:"names"`
+	Image  string `json:"image"`
+	State  string `json:"state"`
+	Status string `json:"status"`
+}
+
+type LogEntry struct {
+	Timestamp string `json:"timestamp"`
+	Level     string `json:"level"` // "info", "warn", "error"
+	Source    string `json:"source"`
+	Message   string `json:"message"`
+}
+
 type MetricData struct {
-	CPUUsagePercent float64       `json:"cpu_usage_percent"`
-	RAM             RAMInfo       `json:"ram"`
-	Disk            DiskInfo      `json:"disk"`
-	TopProcesses    []ProcessInfo `json:"top_processes"`
+	CPUUsagePercent   float64            `json:"cpu_usage_percent"`
+	RAM               RAMInfo            `json:"ram"`
+	Disk              DiskInfo           `json:"disk"`
+	TopProcesses      []ProcessInfo      `json:"top_processes"`
+	NetSentBytesSec   float64            `json:"net_sent_bytes_sec"`
+	NetRecvBytesSec   float64            `json:"net_recv_bytes_sec"`
+	DiskReadBytesSec  float64            `json:"disk_read_bytes_sec"`
+	DiskWriteBytesSec float64            `json:"disk_write_bytes_sec"`
+	Services          map[string]string  `json:"services"`
+	DockerContainers  []DockerContainer  `json:"docker_containers"`
+	Logs              []LogEntry         `json:"logs"`
 }
 
 type MetricsUploadRequest struct {
@@ -66,6 +95,16 @@ type RegisterRequest struct {
 	IPAddress string `json:"ip_address"`
 	OS        string `json:"os"`
 }
+
+// Caching stats for differential speed tracking
+var (
+	prevNetSent   uint64
+	prevNetRecv   uint64
+	prevDiskRead  uint64
+	prevDiskWrite uint64
+	lastCheckTime time.Time
+	logOffsets    = make(map[string]int64)
+)
 
 func main() {
 	log.Println("[+] ServerStatika Agent is starting...")
@@ -87,13 +126,16 @@ func main() {
 	// Perform Handshake & Registration
 	register(config, ipAddress, osName)
 
+	// Setup initial cache values for IO speed tracking
+	initIOCaches()
+
 	// Metrics collection loop
 	ticker := time.NewTicker(config.IntervalSec * time.Second)
 	defer ticker.Stop()
 
 	log.Printf("[+] Entering metric collection loop (Interval: %ds)...\n", config.IntervalSec)
 	for range ticker.C {
-		metrics, err := collectMetrics()
+		metrics, err := collectMetrics(config)
 		if err != nil {
 			log.Printf("[-] Metric collection failed: %v\n", err)
 			continue
@@ -106,9 +148,11 @@ func main() {
 func loadConfig() Config {
 	defaultConfig := Config{
 		ServerURL:   "http://localhost:8080",
-		ServerToken: "srv_local_development",
-		ServerName:  "Local Machine",
+		ServerToken: "srv_dev_local_test",
+		ServerName:  "Development Local Server",
 		IntervalSec: 5,
+		Services:    []string{"ServerStatika:8080"},
+		LogFiles:    []string{},
 	}
 
 	exePath, err := os.Executable()
@@ -118,7 +162,6 @@ func loadConfig() Config {
 
 	configPath := filepath.Join(filepath.Dir(exePath), "config.json")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		// Try current working directory
 		configPath = "config.json"
 	}
 
@@ -193,7 +236,31 @@ func register(cfg Config, ip, osName string) {
 	}
 }
 
-func collectMetrics() (MetricData, error) {
+// initIOCaches warms up previous values for network and disk I/O
+func initIOCaches() {
+	lastCheckTime = time.Now()
+
+	// Warmup Net
+	netStats, err := gopsnet.IOCounters(false)
+	if err == nil && len(netStats) > 0 {
+		prevNetSent = netStats[0].BytesSent
+		prevNetRecv = netStats[0].BytesRecv
+	}
+
+	// Warmup Disk
+	diskStats, err := gopsdisk.IOCounters()
+	if err == nil {
+		var totalRead, totalWrite uint64
+		for _, stat := range diskStats {
+			totalRead += stat.ReadBytes
+			totalWrite += stat.WriteBytes
+		}
+		prevDiskRead = totalRead
+		prevDiskWrite = totalWrite
+	}
+}
+
+func collectMetrics(cfg Config) (MetricData, error) {
 	var metrics MetricData
 
 	// 1. CPU Usage (sample for 500ms to get accurate reading)
@@ -218,7 +285,7 @@ func collectMetrics() (MetricData, error) {
 
 	// 3. Disk Usage
 	diskPath := getDiskPath()
-	dUsage, err := disk.Usage(diskPath)
+	dUsage, err := gopsdisk.Usage(diskPath)
 	if err != nil {
 		return metrics, fmt.Errorf("failed to get disk usage on %s: %w", diskPath, err)
 	}
@@ -232,7 +299,190 @@ func collectMetrics() (MetricData, error) {
 	// 4. Process list
 	metrics.TopProcesses = getTopProcesses(vMem.Total)
 
+	// 5. Calculate Network and Disk I/O speeds
+	calculateIOSpeeds(&metrics)
+
+	// 6. Check Service Statuses
+	metrics.Services = checkServices(cfg.Services)
+
+	// 7. Check Docker containers
+	metrics.DockerContainers = getDockerContainers()
+
+	// 8. Gather new logs
+	metrics.Logs = readNewLogs(cfg.LogFiles)
+
 	return metrics, nil
+}
+
+func calculateIOSpeeds(m *MetricData) {
+	now := time.Now()
+	elapsed := now.Sub(lastCheckTime).Seconds()
+	if elapsed <= 0 {
+		elapsed = 1.0
+	}
+	lastCheckTime = now
+
+	// Network
+	netStats, err := gopsnet.IOCounters(false)
+	if err == nil && len(netStats) > 0 {
+		currSent := netStats[0].BytesSent
+		currRecv := netStats[0].BytesRecv
+
+		if prevNetSent > 0 && currSent >= prevNetSent {
+			m.NetSentBytesSec = float64(currSent-prevNetSent) / elapsed
+		}
+		if prevNetRecv > 0 && currRecv >= prevNetRecv {
+			m.NetRecvBytesSec = float64(currRecv-prevNetRecv) / elapsed
+		}
+
+		prevNetSent = currSent
+		prevNetRecv = currRecv
+	}
+
+	// Disk I/O
+	diskStats, err := gopsdisk.IOCounters()
+	if err == nil {
+		var currRead, currWrite uint64
+		for _, stat := range diskStats {
+			currRead += stat.ReadBytes
+			currWrite += stat.WriteBytes
+		}
+
+		if prevDiskRead > 0 && currRead >= prevDiskRead {
+			m.DiskReadBytesSec = float64(currRead-prevDiskRead) / elapsed
+		}
+		if prevDiskWrite > 0 && currWrite >= prevDiskWrite {
+			m.DiskWriteBytesSec = float64(currWrite-prevDiskWrite) / elapsed
+		}
+
+		prevDiskRead = currRead
+		prevDiskWrite = currWrite
+	}
+}
+
+func checkServices(services []string) map[string]string {
+	statuses := make(map[string]string)
+	for _, s := range services {
+		parts := strings.Split(s, ":")
+		if len(parts) < 2 {
+			continue
+		}
+		name := parts[0]
+		port := parts[1]
+
+		// Try TCP connection with 500ms timeout
+		address := net.JoinHostPort("127.0.0.1", port)
+		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
+		if err != nil {
+			statuses[name] = "inactive"
+		} else {
+			statuses[name] = "active"
+			conn.Close()
+		}
+	}
+	return statuses
+}
+
+type DockerPSOutput struct {
+	ID     string `json:"ID"`
+	Names  string `json:"Names"`
+	Image  string `json:"Image"`
+	State  string `json:"State"`
+	Status string `json:"Status"`
+}
+
+func getDockerContainers() []DockerContainer {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "ps", "--format", "{{json .}}")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		return []DockerContainer{} // Return empty if docker fails or is missing
+	}
+
+	var list []DockerContainer
+	lines := strings.Split(stdout.String(), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var raw DockerPSOutput
+		if err := json.Unmarshal([]byte(line), &raw); err == nil {
+			list = append(list, DockerContainer{
+				ID:     raw.ID,
+				Names:  raw.Names,
+				Image:  raw.Image,
+				State:  raw.State,
+				Status: raw.Status,
+			})
+		}
+	}
+	return list
+}
+
+func readNewLogs(files []string) []LogEntry {
+	var entries []LogEntry
+	for _, fPath := range files {
+		file, err := os.Open(fPath)
+		if err != nil {
+			continue // Skip if can't open
+		}
+
+		stat, err := file.Stat()
+		if err != nil {
+			file.Close()
+			continue
+		}
+
+		prevOffset := logOffsets[fPath]
+		currentSize := stat.Size()
+
+		// If file was truncated or rotated
+		if currentSize < prevOffset {
+			prevOffset = 0
+		}
+
+		if currentSize > prevOffset {
+			_, err = file.Seek(prevOffset, io.SeekStart)
+			if err == nil {
+				reader := bufio.NewReader(file)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						break
+					}
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+
+					level := "info"
+					lowerLine := strings.ToLower(line)
+					if strings.Contains(lowerLine, "error") || strings.Contains(lowerLine, "fail") || strings.Contains(lowerLine, "fatal") {
+						level = "error"
+					} else if strings.Contains(lowerLine, "warn") || strings.Contains(lowerLine, "warning") {
+						level = "warn"
+					}
+
+					entries = append(entries, LogEntry{
+						Timestamp: time.Now().Format(time.RFC3339),
+						Level:     level,
+						Source:    filepath.Base(fPath),
+						Message:   line,
+					})
+				}
+				logOffsets[fPath] = currentSize
+			}
+		}
+		file.Close()
+	}
+	return entries
 }
 
 func getTopProcesses(totalRAM uint64) []ProcessInfo {
@@ -313,7 +563,7 @@ func sendMetrics(cfg Config, m MetricData) {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("[-] Server returned error status %s: %s\n", resp.Status, string(body))
 	} else {
-		log.Printf("[+] Metrics sent: CPU: %.1f%%, RAM: %.1f%%, Disk: %.1f%%\n",
-			m.CPUUsagePercent, m.RAM.Percent, m.Disk.Percent)
+		log.Printf("[+] Metrics sent: CPU: %.1f%%, RAM: %.1f%%, Disk: %.1f%%, Net: %.1f/%.1f KB/s\n",
+			m.CPUUsagePercent, m.RAM.Percent, m.Disk.Percent, m.NetSentBytesSec/1024, m.NetRecvBytesSec/1024)
 	}
 }
