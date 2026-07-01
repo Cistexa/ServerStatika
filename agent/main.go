@@ -96,6 +96,13 @@ type RegisterRequest struct {
 	OS        string `json:"os"`
 }
 
+type AgentCommand struct {
+	ID          string `json:"id"`
+	ServerID    string `json:"server_id"`
+	CommandType string `json:"command_type"`
+	Payload     string `json:"payload"`
+}
+
 // Caching stats for differential speed tracking
 var (
 	prevNetSent   uint64
@@ -565,5 +572,163 @@ func sendMetrics(cfg Config, m MetricData) {
 	} else {
 		log.Printf("[+] Metrics sent: CPU: %.1f%%, RAM: %.1f%%, Disk: %.1f%%, Net: %.1f/%.1f KB/s\n",
 			m.CPUUsagePercent, m.RAM.Percent, m.Disk.Percent, m.NetSentBytesSec/1024, m.NetRecvBytesSec/1024)
+
+		var responseData struct {
+			Commands []AgentCommand `json:"commands"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&responseData); err == nil {
+			if len(responseData.Commands) > 0 {
+				log.Printf("[+] Received %d pending commands from backend. Executing...\n", len(responseData.Commands))
+				for _, cmd := range responseData.Commands {
+					go executeAgentCommand(cfg, cmd)
+				}
+			}
+		}
+	}
+}
+
+func executeAgentCommand(cfg Config, cmd AgentCommand) {
+	log.Printf("[+] Executing command %s (Type: %s, Payload: %s)\n", cmd.ID, cmd.CommandType, cmd.Payload)
+
+	var output string
+	var success bool = false
+
+	switch cmd.CommandType {
+	case "docker":
+		type DockerPayload struct {
+			ContainerID string `json:"container_id"`
+			Action      string `json:"action"` // "start", "stop", "restart"
+		}
+		var dp DockerPayload
+		if err := json.Unmarshal([]byte(cmd.Payload), &dp); err == nil {
+			if dp.Action == "start" || dp.Action == "stop" || dp.Action == "restart" {
+				log.Printf("[+] Running: docker %s %s\n", dp.Action, dp.ContainerID)
+				c := exec.Command("docker", dp.Action, dp.ContainerID)
+				out, err := c.CombinedOutput()
+				if err != nil {
+					output = fmt.Sprintf("Error running docker command: %v\nOutput: %s", err, string(out))
+				} else {
+					output = string(out)
+					success = true
+				}
+			} else {
+				output = fmt.Sprintf("Invalid Docker action: %s", dp.Action)
+			}
+		} else {
+			output = fmt.Sprintf("Invalid Docker command payload: %s", cmd.Payload)
+		}
+
+	case "process":
+		type ProcessPayload struct {
+			PID int32 `json:"pid"`
+		}
+		var pp ProcessPayload
+		if err := json.Unmarshal([]byte(cmd.Payload), &pp); err == nil {
+			log.Printf("[+] Killing process: %d\n", pp.PID)
+			var killCmd *exec.Cmd
+			if runtime.GOOS == "windows" {
+				killCmd = exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pp.PID))
+			} else {
+				killCmd = exec.Command("kill", "-9", fmt.Sprintf("%d", pp.PID))
+			}
+			out, err := killCmd.CombinedOutput()
+			if err != nil {
+				output = fmt.Sprintf("Error killing process %d: %v\nOutput: %s", pp.PID, err, string(out))
+			} else {
+				output = fmt.Sprintf("Successfully killed process %d\nOutput: %s", pp.PID, string(out))
+				success = true
+			}
+		} else {
+			output = fmt.Sprintf("Invalid Process kill payload: %s", cmd.Payload)
+		}
+
+	case "diagnostics":
+		type DiagnosticsPayload struct {
+			Command string `json:"command"`
+		}
+		var dp DiagnosticsPayload
+		if err := json.Unmarshal([]byte(cmd.Payload), &dp); err == nil {
+			var dCmd *exec.Cmd
+			switch dp.Command {
+			case "ping":
+				if runtime.GOOS == "windows" {
+					dCmd = exec.Command("ping", "-n", "4", "8.8.8.8")
+				} else {
+					dCmd = exec.Command("ping", "-c", "4", "8.8.8.8")
+				}
+			case "netstat":
+				if runtime.GOOS == "windows" {
+					dCmd = exec.Command("netstat", "-ano")
+				} else {
+					dCmd = exec.Command("netstat", "-plntu")
+				}
+			case "diskspace":
+				if runtime.GOOS == "windows" {
+					dCmd = exec.Command("wmic", "logicaldisk", "get", "caption,size,freespace")
+				} else {
+					dCmd = exec.Command("df", "-h")
+				}
+			default:
+				output = fmt.Sprintf("Unknown diagnostics command: %s", dp.Command)
+			}
+
+			if dCmd != nil {
+				log.Printf("[+] Running diagnostic: %v\n", dCmd.Args)
+				out, err := dCmd.CombinedOutput()
+				if err != nil {
+					if dp.Command == "netstat" && runtime.GOOS != "windows" {
+						dCmdFallback := exec.Command("ss", "-tulpn")
+						outF, errF := dCmdFallback.CombinedOutput()
+						if errF == nil {
+							output = string(outF)
+							success = true
+						} else {
+							output = fmt.Sprintf("Diagnostics command failed: %v\nOutput: %s\nFallback ss failed: %v\nOutput: %s", err, string(out), errF, string(outF))
+						}
+					} else {
+						output = fmt.Sprintf("Diagnostics command failed: %v\nOutput: %s", err, string(out))
+					}
+				} else {
+					output = string(out)
+					success = true
+				}
+			}
+		} else {
+			output = fmt.Sprintf("Invalid Diagnostics command payload: %s", cmd.Payload)
+		}
+
+	default:
+		output = fmt.Sprintf("Unknown command type: %s", cmd.CommandType)
+	}
+
+	statusStr := "failed"
+	if success {
+		statusStr = "success"
+	}
+	sendResultToBackend(cfg, cmd.ID, statusStr, output)
+}
+
+func sendResultToBackend(cfg Config, cmdID, status, result string) {
+	url := fmt.Sprintf("%s/api/agent/commands/result", cfg.ServerURL)
+	payload := map[string]string{
+		"command_id": cmdID,
+		"status":     status,
+		"result":     result,
+	}
+
+	jsonPayload, _ := json.Marshal(payload)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("[-] Failed to send command %s result to backend: %v\n", cmdID, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[-] Backend returned error for command result %s: %s\n", cmdID, string(body))
+	} else {
+		log.Printf("[+] Command %s result sent to backend: %s\n", cmdID, status)
 	}
 }

@@ -1,22 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Activity, 
   Server as ServerIcon, 
   AlertTriangle, 
-  Cpu, 
-  Database, 
-  HardDrive, 
   CheckCircle, 
   Clock, 
-  Terminal, 
   RefreshCw,
-  Info,
-  ArrowDownLeft,
-  ArrowUpRight,
-  TrendingUp,
-  List,
-  Layers
+  Settings
 } from 'lucide-react';
+
+import Sidebar from './components/Sidebar';
+import SettingsModal from './components/SettingsModal';
+import MetricGauges from './components/MetricGauges';
+import ThroughputCards from './components/ThroughputCards';
+import SVGChart from './components/SVGChart';
+import ProcessesTable from './components/ProcessesTable';
+import DockerTable from './components/DockerTable';
+import ServicesWidget from './components/ServicesWidget';
+import TerminalPanel from './components/TerminalPanel';
 
 const API_BASE = window.location.port === '5173' ? 'http://localhost:8080' : '';
 
@@ -30,6 +30,18 @@ function App() {
   const [accumulatedLogs, setAccumulatedLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lastRefreshed, setLastRefreshed] = useState(new Date());
+  
+  // States for Remote Command Execution and Threshold Settings
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [cpuLimit, setCpuLimit] = useState(90);
+  const [ramLimit, setRamLimit] = useState(90);
+  const [diskLimit, setDiskLimit] = useState(90);
+  
+  const [terminalActiveTab, setTerminalActiveTab] = useState('logs'); // 'logs' | 'diagnostics'
+  const [commandHistory, setCommandHistory] = useState([]);
+  const [runningCommandId, setRunningCommandId] = useState(null);
+  const [selectedDiagnosticCmd, setSelectedDiagnosticCmd] = useState('ping');
+  const [isExecutingDiagnostic, setIsExecutingDiagnostic] = useState(false);
 
   const terminalConsoleRef = useRef(null);
 
@@ -144,8 +156,126 @@ function App() {
     }
   }, [accumulatedLogs]);
 
+  // Fetch command history periodically
+  useEffect(() => {
+    if (!selectedServerId) return;
+    fetchCommandHistory(selectedServerId);
+    const interval = setInterval(() => {
+      fetchCommandHistory(selectedServerId);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [selectedServerId]);
+
   // Selected server details
   const selectedServer = servers.find(s => s.id === selectedServerId);
+
+  // Load configured thresholds when selected server changes
+  useEffect(() => {
+    if (selectedServer) {
+      setCpuLimit(selectedServer.cpu_threshold || 90);
+      setRamLimit(selectedServer.ram_threshold || 90);
+      setDiskLimit(selectedServer.disk_threshold || 90);
+    }
+  }, [selectedServerId, servers]);
+
+  const fetchCommandHistory = async (serverId) => {
+    if (!serverId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/servers/${serverId}/commands?limit=15`);
+      if (res.ok) {
+        const data = await res.json();
+        setCommandHistory(data || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch commands history", err);
+    }
+  };
+
+  const queueCommand = async (type, payload) => {
+    if (!selectedServerId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/servers/${selectedServerId}/commands`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command_type: type, payload: JSON.stringify(payload) })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        fetchCommandHistory(selectedServerId);
+        return data.command_id;
+      }
+    } catch (err) {
+      console.error("Failed to queue command", err);
+    }
+  };
+
+  const handleDockerAction = async (containerId, action) => {
+    setRunningCommandId(containerId + '-' + action);
+    await queueCommand('docker', { container_id: containerId, action: action });
+    setTimeout(() => {
+      setRunningCommandId(null);
+    }, 6000);
+  };
+
+  const handleKillProcess = async (pid, processName) => {
+    if (window.confirm(`Are you sure you want to terminate process ${processName} (PID: ${pid})?`)) {
+      setRunningCommandId('kill-' + pid);
+      await queueCommand('process', { pid: parseInt(pid) });
+      setTimeout(() => {
+        setRunningCommandId(null);
+      }, 6000);
+    }
+  };
+
+  const handleRunDiagnostic = async () => {
+    setIsExecutingDiagnostic(true);
+    const cmdId = await queueCommand('diagnostics', { command: selectedDiagnosticCmd });
+    
+    let attempts = 0;
+    const pollInterval = setInterval(async () => {
+      attempts++;
+      try {
+        const res = await fetch(`${API_BASE}/api/servers/${selectedServerId}/commands?limit=5`);
+        if (res.ok) {
+          const data = await res.json();
+          const targetCmd = data.find(c => c.id === cmdId);
+          if (targetCmd && (targetCmd.status === 'success' || targetCmd.status === 'failed')) {
+            clearInterval(pollInterval);
+            setIsExecutingDiagnostic(false);
+            fetchCommandHistory(selectedServerId);
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      }
+      if (attempts > 10) {
+        clearInterval(pollInterval);
+        setIsExecutingDiagnostic(false);
+      }
+    }, 2000);
+  };
+
+  const handleSaveThresholds = async () => {
+    if (!selectedServerId) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/servers/${selectedServerId}/thresholds`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cpu_threshold: parseFloat(cpuLimit),
+          ram_threshold: parseFloat(ramLimit),
+          disk_threshold: parseFloat(diskLimit)
+        })
+      });
+      if (res.ok) {
+        setShowSettingsModal(false);
+        fetchServers();
+      }
+    } catch (err) {
+      console.error("Failed to update thresholds", err);
+    }
+  };
+
   const latestMetricRecord = metrics[metrics.length - 1];
   const latestMetrics = latestMetricRecord ? latestMetricRecord.metrics : null;
 
@@ -154,255 +284,17 @@ function App() {
   const onlineServers = servers.filter(s => s.status === 'online').length;
   const activeAlerts = alerts.filter(a => !a.resolved_at).length;
 
-  // Bytes converter
-  const formatSpeed = (bytesSec) => {
-    if (bytesSec === undefined || bytesSec === null || isNaN(bytesSec)) return '0 B/s';
-    if (bytesSec < 1024) return `${bytesSec.toFixed(0)} B/s`;
-    if (bytesSec < 1024 * 1024) return `${(bytesSec / 1024).toFixed(1)} KB/s`;
-    return `${(bytesSec / (1024 * 1024)).toFixed(1)} MB/s`;
-  };
-
-  // Custom SVG Chart Generator
-  const renderSVGChart = () => {
-    if (metrics.length === 0) {
-      return (
-        <div className="empty-state">
-          <Info size={32} />
-          <p>No performance history available. Ensure the agent is reporting.</p>
-        </div>
-      );
-    }
-
-    const width = 600;
-    const height = 220;
-    const padding = 40;
-    
-    // Get values based on selected metric tab
-    const points = metrics.map((m, index) => {
-      let val = 0;
-      if (activeChartMetric === 'cpu') val = m.metrics.cpu_usage_percent;
-      else if (activeChartMetric === 'ram') val = m.metrics.ram.percent;
-      else if (activeChartMetric === 'disk') val = m.metrics.disk.percent;
-
-      return {
-        x: padding + (index / Math.max(1, metrics.length - 1)) * (width - padding * 2),
-        y: height - padding - (val / 100) * (height - padding * 2),
-        val: val,
-        time: new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      };
-    });
-
-    const activeColor = activeChartMetric === 'cpu' ? 'var(--color-cpu)' :
-                        activeChartMetric === 'ram' ? 'var(--color-ram)' : 'var(--color-disk)';
-
-    // Build SVG Path
-    let pathD = "";
-    let areaD = "";
-    if (points.length > 0) {
-      pathD = `M ${points[0].x} ${points[0].y}`;
-      areaD = `M ${points[0].x} ${height - padding}`;
-      
-      for (let i = 0; i < points.length; i++) {
-        pathD += ` L ${points[i].x} ${points[i].y}`;
-        areaD += ` L ${points[i].x} ${points[i].y}`;
-      }
-      
-      areaD += ` L ${points[points.length - 1].x} ${height - padding} Z`;
-    }
-
-    return (
-      <svg className="chart-svg" viewBox={`0 0 ${width} ${height}`} width="100%" height="100%">
-        <defs>
-          <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={activeColor} stopOpacity="0.25" />
-            <stop offset="100%" stopColor={activeColor} stopOpacity="0.0" />
-          </linearGradient>
-        </defs>
-
-        {/* Gridlines */}
-        {[0, 25, 50, 75, 100].map((grid, i) => {
-          const y = height - padding - (grid / 100) * (height - padding * 2);
-          return (
-            <g key={i}>
-              <line 
-                x1={padding} 
-                y1={y} 
-                x2={width - padding} 
-                y2={y} 
-                stroke="rgba(255,255,255,0.03)" 
-                strokeWidth="1" 
-              />
-              <text 
-                x={padding - 10} 
-                y={y + 4} 
-                fill="var(--text-muted)" 
-                fontSize="10" 
-                textAnchor="end"
-                fontWeight="600"
-              >
-                {grid}%
-              </text>
-            </g>
-          );
-        })}
-
-        {/* X axis labels (first and last timestamp) */}
-        {points.length > 1 && (
-          <>
-            <text 
-              x={points[0].x} 
-              y={height - padding + 20} 
-              fill="var(--text-muted)" 
-              fontSize="10" 
-              fontWeight="600"
-            >
-              {points[0].time}
-            </text>
-            <text 
-              x={points[points.length - 1].x} 
-              y={height - padding + 20} 
-              fill="var(--text-muted)" 
-              fontSize="10" 
-              textAnchor="end"
-              fontWeight="600"
-            >
-              {points[points.length - 1].time}
-            </text>
-          </>
-        )}
-
-        {/* Area fill */}
-        {areaD && <path d={areaD} fill="url(#chartGradient)" />}
-
-        {/* Stroke path */}
-        {pathD && (
-          <path 
-            d={pathD} 
-            fill="none" 
-            stroke={activeColor} 
-            strokeWidth="2.5" 
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        )}
-
-        {/* Interactive dots */}
-        {points.map((p, i) => (
-          <g key={i} className="chart-dot-group">
-            <circle 
-              cx={p.x} 
-              cy={p.y} 
-              r="3.5" 
-              fill={p.val > 90 ? 'var(--color-alert)' : activeColor} 
-              stroke="var(--bg-card)" 
-              strokeWidth="1.5" 
-            />
-            <title>{`${p.val.toFixed(1)}% at ${p.time}`}</title>
-          </g>
-        ))}
-      </svg>
-    );
-  };
-
-  // Helper to render radial/circular dashboard dial
-  const renderGauge = (percent, colorClass, colorGlow) => {
-    const radius = 50;
-    const circumference = 2 * Math.PI * radius;
-    const strokeDashoffset = circumference - (percent / 100) * circumference;
-
-    return (
-      <div className="metric-dial-container">
-        <svg className="gauge-svg">
-          <circle className="gauge-bg" cx="60" cy="60" r={radius} />
-          <circle 
-            className="gauge-fill" 
-            cx="60" 
-            cy="60" 
-            r={radius} 
-            stroke={colorClass}
-            strokeDasharray={circumference}
-            strokeDashoffset={strokeDashoffset}
-            style={{ filter: `drop-shadow(0 0 4px ${colorGlow})` }}
-          />
-        </svg>
-        <div className="metric-value-label">
-          <span className="metric-number" style={{ color: percent > 90 ? 'var(--color-alert)' : 'var(--text-primary)' }}>
-            {percent.toFixed(1)}
-          </span>
-          <span className="metric-unit">%</span>
-        </div>
-      </div>
-    );
-  };
-
   return (
     <div className="app-container">
       {/* Sidebar Section */}
-      <aside className="sidebar">
-        <div className="logo-container">
-          <div className="logo-icon">
-            <Activity size={20} />
-          </div>
-          <span className="logo-text">ServerStatika</span>
-        </div>
-
-        <section className="menu-section">
-          <div className="menu-title">Navigation</div>
-          <div 
-            className={`nav-item ${activeTab === 'dashboard' ? 'active' : ''}`}
-            onClick={() => setActiveTab('dashboard')}
-          >
-            <Activity size={18} />
-            <span>Dashboard</span>
-          </div>
-          <div 
-            className={`nav-item ${activeTab === 'alerts' ? 'active' : ''}`}
-            onClick={() => setActiveTab('alerts')}
-          >
-            <AlertTriangle size={18} />
-            <span>Alert Logs</span>
-            {activeAlerts > 0 && (
-              <span style={{
-                backgroundColor: 'var(--color-alert)',
-                color: 'white',
-                fontSize: '10px',
-                padding: '2px 6px',
-                borderRadius: '99px',
-                marginLeft: 'auto',
-                fontWeight: '800'
-              }}>{activeAlerts}</span>
-            )}
-          </div>
-        </section>
-
-        <section className="menu-section" style={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
-          <div className="menu-title">Monitored Servers</div>
-          <div className="server-list-container">
-            {servers.length === 0 ? (
-              <p style={{ color: 'var(--text-muted)', fontSize: '12px', paddingLeft: '12px' }}>
-                No active servers.
-              </p>
-            ) : (
-              servers.map(s => (
-                <div 
-                  key={s.id}
-                  className={`server-item ${selectedServerId === s.id && activeTab === 'dashboard' ? 'active' : ''}`}
-                  onClick={() => {
-                    setSelectedServerId(s.id);
-                    setActiveTab('dashboard');
-                  }}
-                >
-                  <div className="server-item-info">
-                    <span className="server-item-name">{s.name}</span>
-                    <span className="server-item-ip">{s.ip_address}</span>
-                  </div>
-                  <span className={`status-indicator ${s.status}`} title={s.status} />
-                </div>
-              ))
-            )}
-          </div>
-        </section>
-      </aside>
+      <Sidebar 
+        servers={servers}
+        selectedServerId={selectedServerId}
+        setSelectedServerId={setSelectedServerId}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        activeAlerts={activeAlerts}
+      />
 
       {/* Main Content Dashboard */}
       <main className="main-panel">
@@ -487,11 +379,18 @@ function App() {
                     <ServerIcon size={24} />
                   </div>
                   <div className="server-meta-text">
-                    <h2>
+                    <h2 style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                       {selectedServer.name} 
                       <span className={`server-badge ${selectedServer.status}`}>
                         {selectedServer.status}
                       </span>
+                      <button 
+                        onClick={() => setShowSettingsModal(true)}
+                        className="server-settings-trigger"
+                        title="Configure Alert Thresholds"
+                      >
+                        <Settings size={18} />
+                      </button>
                     </h2>
                     <div className="server-meta-tags">
                       <span><strong>IP:</strong> {selectedServer.ip_address}</span>
@@ -506,278 +405,49 @@ function App() {
               {latestMetrics ? (
                 <>
                   {/* Real-time Metric Dials */}
-                  <div className="metrics-card-grid">
-                    <div className="metric-card">
-                      <div className="metric-card-header">
-                        <span className="metric-title"><Cpu size={18} color="var(--color-cpu)" /> CPU Usage</span>
-                      </div>
-                      {renderGauge(latestMetrics.cpu_usage_percent, 'var(--color-cpu)', 'var(--color-cpu-glow)')}
-                      <div className="metric-footer">
-                        <span>Metrics status</span>
-                        <span style={{ color: 'var(--color-online)' }}>Live streaming</span>
-                      </div>
-                    </div>
-
-                    <div className="metric-card">
-                      <div className="metric-card-header">
-                        <span className="metric-title"><Database size={18} color="var(--color-ram)" /> Memory (RAM)</span>
-                      </div>
-                      {renderGauge(latestMetrics.ram.percent, 'var(--color-ram)', 'var(--color-ram-glow)')}
-                      <div className="metric-footer">
-                        <span>Used: <strong>{latestMetrics.ram.used_mb} MB</strong></span>
-                        <span>Total: <strong>{latestMetrics.ram.total_mb} MB</strong></span>
-                      </div>
-                    </div>
-
-                    <div className="metric-card">
-                      <div className="metric-card-header">
-                        <span className="metric-title"><HardDrive size={18} color="var(--color-disk)" /> Storage (Disk)</span>
-                      </div>
-                      {renderGauge(latestMetrics.disk.percent, 'var(--color-disk)', 'var(--color-disk-glow)')}
-                      <div className="metric-footer">
-                        <span>Used: <strong>{latestMetrics.disk.used_gb} GB</strong></span>
-                        <span>Total: <strong>{latestMetrics.disk.total_gb} GB</strong></span>
-                      </div>
-                    </div>
-                  </div>
+                  <MetricGauges latestMetrics={latestMetrics} />
 
                   {/* DevOps Network & Disk Throughput Grid */}
-                  <div className="metrics-card-grid" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '28px' }}>
-                    <div className="metric-card" style={{ padding: '20px 24px' }}>
-                      <div className="metric-card-header" style={{ marginBottom: '14px' }}>
-                        <span className="metric-title" style={{ fontSize: '14px' }}>
-                          <TrendingUp size={16} color="var(--color-cpu)" /> Network Throughput
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', height: '80px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                          <div style={{ backgroundColor: 'rgba(6, 182, 212, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-cpu)' }}>
-                            <ArrowDownLeft size={20} />
-                          </div>
-                          <div>
-                            <div className="stat-label" style={{ fontSize: '10px' }}>Download (Rx)</div>
-                            <div className="speed-badge">{formatSpeed(latestMetrics.net_recv_bytes_sec)}</div>
-                          </div>
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                          <div style={{ backgroundColor: 'rgba(217, 70, 239, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-ram)' }}>
-                            <ArrowUpRight size={20} />
-                          </div>
-                          <div>
-                            <div className="stat-label" style={{ fontSize: '10px' }}>Upload (Tx)</div>
-                            <div className="speed-badge">{formatSpeed(latestMetrics.net_sent_bytes_sec)}</div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="metric-card" style={{ padding: '20px 24px' }}>
-                      <div className="metric-card-header" style={{ marginBottom: '14px' }}>
-                        <span className="metric-title" style={{ fontSize: '14px' }}>
-                          <HardDrive size={16} color="var(--color-disk)" /> Disk Activity (Read/Write)
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', height: '80px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                          <div style={{ backgroundColor: 'rgba(16, 185, 129, 0.08)', padding: '10px', borderRadius: '10px', color: 'var(--color-disk)' }}>
-                            <ArrowDownLeft size={20} />
-                          </div>
-                          <div>
-                            <div className="stat-label" style={{ fontSize: '10px' }}>Read speed</div>
-                            <div className="speed-badge">{formatSpeed(latestMetrics.disk_read_bytes_sec)}</div>
-                          </div>
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                          <div style={{ backgroundColor: 'rgba(255, 255, 255, 0.05)', padding: '10px', borderRadius: '10px', color: 'var(--text-secondary)' }}>
-                            <ArrowUpRight size={20} />
-                          </div>
-                          <div>
-                            <div className="stat-label" style={{ fontSize: '10px' }}>Write speed</div>
-                            <div className="speed-badge">{formatSpeed(latestMetrics.disk_write_bytes_sec)}</div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
+                  <ThroughputCards latestMetrics={latestMetrics} />
 
                   {/* SVG Charts & Processes Row */}
                   <div className="dashboard-details-row">
-                    <div className="chart-card">
-                      <div className="chart-header">
-                        <span className="chart-title"><Activity size={18} /> Performance History</span>
-                        <div className="chart-tabs">
-                          <button 
-                            className={`chart-tab-btn ${activeChartMetric === 'cpu' ? 'active' : ''}`}
-                            onClick={() => setActiveChartMetric('cpu')}
-                          >
-                            CPU
-                          </button>
-                          <button 
-                            className={`chart-tab-btn ${activeChartMetric === 'ram' ? 'active' : ''}`}
-                            onClick={() => setActiveChartMetric('ram')}
-                          >
-                            RAM
-                          </button>
-                          <button 
-                            className={`chart-tab-btn ${activeChartMetric === 'disk' ? 'active' : ''}`}
-                            onClick={() => setActiveChartMetric('disk')}
-                          >
-                            Disk
-                          </button>
-                        </div>
-                      </div>
-                      <div className="chart-container">
-                        {renderSVGChart()}
-                      </div>
-                    </div>
+                    <SVGChart 
+                      metrics={metrics}
+                      activeChartMetric={activeChartMetric}
+                      setActiveChartMetric={setActiveChartMetric}
+                    />
 
-                    <div className="processes-card">
-                      <div className="processes-header">
-                        <span className="processes-title"><List size={18} /> Top Processes</span>
-                      </div>
-                      <table className="processes-table">
-                        <thead>
-                          <tr>
-                            <th>PID</th>
-                            <th>Name</th>
-                            <th>CPU %</th>
-                            <th>RAM %</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {latestMetrics.top_processes && latestMetrics.top_processes.length > 0 ? (
-                            latestMetrics.top_processes.map((p, idx) => (
-                              <tr key={idx}>
-                                <td>{p.pid}</td>
-                                <td className="proc-name">{p.name}</td>
-                                <td className="proc-cpu-badge">{p.cpu.toFixed(1)}%</td>
-                                <td className="proc-ram-badge">{p.ram.toFixed(1)}%</td>
-                              </tr>
-                            ))
-                          ) : (
-                            <tr>
-                              <td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)' }}>
-                                No process metrics
-                              </td>
-                            </tr>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
+                    <ProcessesTable 
+                      latestMetrics={latestMetrics}
+                      runningCommandId={runningCommandId}
+                      handleKillProcess={handleKillProcess}
+                    />
                   </div>
 
                   {/* DevOps Services Statuses & Docker Containers */}
                   <div className="dashboard-details-row" style={{ gridTemplateColumns: '1fr 1fr', marginBottom: '24px' }}>
-                    <div className="containers-card">
-                      <div className="processes-header" style={{ marginBottom: '10px' }}>
-                        <span className="processes-title">
-                          <Layers size={18} /> Docker Containers
-                        </span>
-                        {latestMetrics.docker_containers && (
-                          <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontWeight: '600' }}>
-                            {latestMetrics.docker_containers.length} active
-                          </span>
-                        )}
-                      </div>
-                      <div style={{ overflowX: 'auto' }}>
-                        <table className="containers-table">
-                          <thead>
-                            <tr>
-                              <th>Name</th>
-                              <th>Image</th>
-                              <th>Status</th>
-                              <th>State</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {latestMetrics.docker_containers && latestMetrics.docker_containers.length > 0 ? (
-                              latestMetrics.docker_containers.map((c, idx) => (
-                                <tr key={idx}>
-                                  <td className="container-name">{c.names}</td>
-                                  <td className="container-image" title={c.image}>
-                                    {c.image.length > 20 ? c.image.substring(0, 20) + '...' : c.image}
-                                  </td>
-                                  <td style={{ fontSize: '11px' }}>{c.status}</td>
-                                  <td>
-                                    <span className={`container-state-badge ${c.state}`}>
-                                      {c.state}
-                                    </span>
-                                  </td>
-                                </tr>
-                              ))
-                            ) : (
-                              <tr>
-                                <td colSpan="4" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px 0' }}>
-                                  No Docker containers running or daemon offline.
-                                </td>
-                              </tr>
-                            )}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
+                    <DockerTable 
+                      latestMetrics={latestMetrics}
+                      runningCommandId={runningCommandId}
+                      handleDockerAction={handleDockerAction}
+                    />
 
-                    <div className="processes-card" style={{ display: 'flex', flexDirection: 'column' }}>
-                      <div className="processes-header">
-                        <span className="processes-title">
-                          <CheckCircle size={18} /> Monitored Services Health
-                        </span>
-                      </div>
-                      <div style={{ flexGrow: 1, overflowY: 'auto' }}>
-                        {latestMetrics.services && Object.keys(latestMetrics.services).length > 0 ? (
-                          <div className="services-widget">
-                            {Object.entries(latestMetrics.services).map(([name, status]) => (
-                              <div className="service-status-card" key={name}>
-                                <span className="service-name">{name}</span>
-                                <span className={`service-status-badge ${status}`}>{status}</span>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="empty-state" style={{ padding: '20px' }}>
-                            <Info size={24} />
-                            <p style={{ fontSize: '12px' }}>
-                              No port monitors configured in config.json.
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    </div>
+                    <ServicesWidget latestMetrics={latestMetrics} />
                   </div>
 
-                  {/* DevOps Live Log Terminal Console */}
-                  <div className="terminal-card">
-                    <header className="terminal-header">
-                      <span className="terminal-title">
-                        <Terminal size={18} color="var(--color-cpu)" /> Live Log Stream (File Tailer)
-                      </span>
-                      <div className="terminal-controls">
-                        <div className="terminal-dot red" />
-                        <div className="terminal-dot yellow" />
-                        <div className="terminal-dot green" />
-                      </div>
-                    </header>
-                    <div className="terminal-console" ref={terminalConsoleRef}>
-                      {accumulatedLogs.length === 0 ? (
-                        <div style={{ color: 'var(--text-muted)', fontStyle: 'italic', padding: '10px 0' }}>
-                          Waiting for application log lines... Make sure log file exists and is populated.
-                        </div>
-                      ) : (
-                        accumulatedLogs.map((logLine, idx) => (
-                          <div className="terminal-line" key={idx}>
-                            <span className="terminal-time">
-                              [{new Date(logLine.timestamp).toLocaleTimeString()}]
-                            </span>
-                            <span className="terminal-src">{logLine.source}</span>
-                            <span className={`terminal-level ${logLine.level}`}>
-                              {logLine.level}
-                            </span>
-                            <span className="terminal-msg">{logLine.message}</span>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
+                  {/* Live Log Stream & Diagnostics Terminal Panel */}
+                  <TerminalPanel 
+                    terminalActiveTab={terminalActiveTab}
+                    setTerminalActiveTab={setTerminalActiveTab}
+                    accumulatedLogs={accumulatedLogs}
+                    terminalConsoleRef={terminalConsoleRef}
+                    selectedDiagnosticCmd={selectedDiagnosticCmd}
+                    setSelectedDiagnosticCmd={setSelectedDiagnosticCmd}
+                    isExecutingDiagnostic={isExecutingDiagnostic}
+                    handleRunDiagnostic={handleRunDiagnostic}
+                    commandHistory={commandHistory}
+                  />
 
                 </>
               ) : (
@@ -853,6 +523,20 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* Settings Modal */}
+      <SettingsModal 
+        showSettingsModal={showSettingsModal}
+        setShowSettingsModal={setShowSettingsModal}
+        selectedServer={selectedServer}
+        cpuLimit={cpuLimit}
+        setCpuLimit={setCpuLimit}
+        ramLimit={ramLimit}
+        setRamLimit={setRamLimit}
+        diskLimit={diskLimit}
+        setDiskLimit={setDiskLimit}
+        handleSaveThresholds={handleSaveThresholds}
+      />
     </div>
   );
 }

@@ -81,7 +81,15 @@ func handlePostMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	JSONResponse(w, http.StatusOK, map[string]string{"status": "metrics saved"})
+	cmds, err := GetPendingCommands(req.ServerToken)
+	if err != nil {
+		cmds = []AgentCommand{}
+	}
+
+	JSONResponse(w, http.StatusOK, map[string]interface{}{
+		"status":   "metrics saved",
+		"commands": cmds,
+	})
 }
 
 // handleGetServers retrieves all servers.
@@ -179,4 +187,139 @@ func enableCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+type QueueCommandRequest struct {
+	CommandType string `json:"command_type"`
+	Payload     string `json:"payload"`
+}
+
+type CommandResultRequest struct {
+	CommandID string `json:"command_id"`
+	Status    string `json:"status"` // "success", "failed"
+	Result    string `json:"result"`
+}
+
+type UpdateThresholdsRequest struct {
+	CPUThreshold  float64 `json:"cpu_threshold"`
+	RAMThreshold  float64 `json:"ram_threshold"`
+	DiskThreshold float64 `json:"disk_threshold"`
+}
+
+func handleQueueCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		JSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	serverID := r.PathValue("id")
+	if serverID == "" {
+		JSONError(w, http.StatusBadRequest, "Server ID is required")
+		return
+	}
+
+	var req QueueCommandRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		JSONError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.CommandType == "" || req.Payload == "" {
+		JSONError(w, http.StatusBadRequest, "CommandType and Payload are required")
+		return
+	}
+
+	cmdID, err := QueueCommand(serverID, req.CommandType, req.Payload)
+	if err != nil {
+		JSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	JSONResponse(w, http.StatusOK, map[string]string{"status": "queued", "command_id": cmdID})
+}
+
+func handleGetCommands(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		JSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	serverID := r.PathValue("id")
+	if serverID == "" {
+		JSONError(w, http.StatusBadRequest, "Server ID is required")
+		return
+	}
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 10
+	if limitStr != "" {
+		if val, err := strconv.Atoi(limitStr); err == nil && val > 0 {
+			limit = val
+		}
+	}
+
+	cmds, err := GetCommands(serverID, limit)
+	if err != nil {
+		JSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if cmds == nil {
+		cmds = []AgentCommand{}
+	}
+
+	JSONResponse(w, http.StatusOK, cmds)
+}
+
+func handlePostCommandResult(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		JSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req CommandResultRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		JSONError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	if req.CommandID == "" || req.Status == "" {
+		JSONError(w, http.StatusBadRequest, "CommandID and Status are required")
+		return
+	}
+
+	err := UpdateCommandResult(req.CommandID, req.Status, req.Result)
+	if err != nil {
+		JSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	JSONResponse(w, http.StatusOK, map[string]string{"status": "result updated"})
+}
+
+func handleUpdateThresholds(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		JSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	serverID := r.PathValue("id")
+	if serverID == "" {
+		JSONError(w, http.StatusBadRequest, "Server ID is required")
+		return
+	}
+
+	var req UpdateThresholdsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		JSONError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+
+	err := UpdateThresholds(serverID, req.CPUThreshold, req.RAMThreshold, req.DiskThreshold)
+	if err != nil {
+		JSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	JSONResponse(w, http.StatusOK, map[string]string{"status": "thresholds updated"})
 }

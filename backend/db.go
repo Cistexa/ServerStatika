@@ -12,13 +12,16 @@ import (
 var db *sql.DB
 
 type Server struct {
-	ID        string    `json:"id"` // token
-	Name      string    `json:"name"`
-	IPAddress string    `json:"ip_address"`
-	OS        string    `json:"os"`
-	LastSeen  time.Time `json:"last_seen"`
-	CreatedAt time.Time `json:"created_at"`
-	Status    string    `json:"status"` // "online", "offline"
+	ID            string    `json:"id"` // token
+	Name          string    `json:"name"`
+	IPAddress     string    `json:"ip_address"`
+	OS            string    `json:"os"`
+	LastSeen      time.Time `json:"last_seen"`
+	CreatedAt     time.Time `json:"created_at"`
+	Status        string    `json:"status"` // "online", "offline"
+	CPUThreshold  float64   `json:"cpu_threshold"`
+	RAMThreshold  float64   `json:"ram_threshold"`
+	DiskThreshold float64   `json:"disk_threshold"`
 }
 
 type RAMInfo struct {
@@ -105,7 +108,10 @@ func InitDB(dbPath string) error {
 			os TEXT NOT NULL,
 			last_seen DATETIME NOT NULL,
 			created_at DATETIME NOT NULL,
-			status TEXT DEFAULT 'online'
+			status TEXT DEFAULT 'online',
+			cpu_threshold REAL DEFAULT 90.0,
+			ram_threshold REAL DEFAULT 90.0,
+			disk_threshold REAL DEFAULT 90.0
 		);`,
 		`CREATE TABLE IF NOT EXISTS metrics (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,12 +144,34 @@ func InitDB(dbPath string) error {
 			resolved_at DATETIME,
 			FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
 		);`,
+		`CREATE TABLE IF NOT EXISTS agent_commands (
+			id TEXT PRIMARY KEY,
+			server_id TEXT NOT NULL,
+			command_type TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			status TEXT NOT NULL,
+			result TEXT,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+		);`,
 	}
 
 	for _, query := range queries {
 		if _, err := db.Exec(query); err != nil {
 			return fmt.Errorf("failed to execute query %q: %w", query, err)
 		}
+	}
+
+	// Dynamic column migrations if DB already existed
+	alterQueries := []string{
+		"ALTER TABLE servers ADD COLUMN cpu_threshold REAL DEFAULT 90.0;",
+		"ALTER TABLE servers ADD COLUMN ram_threshold REAL DEFAULT 90.0;",
+		"ALTER TABLE servers ADD COLUMN disk_threshold REAL DEFAULT 90.0;",
+	}
+	for _, q := range alterQueries {
+		// Ignore error if column already exists
+		_, _ = db.Exec(q)
 	}
 
 	return nil
@@ -167,15 +195,24 @@ func RegisterServer(id, name, ip, os string) (*Server, error) {
 		return nil, fmt.Errorf("failed to upsert server: %w", err)
 	}
 
-	return &Server{
-		ID:        id,
-		Name:      name,
-		IPAddress: ip,
-		OS:        os,
-		LastSeen:  now,
-		CreatedAt: now,
-		Status:    "online",
-	}, nil
+	var s Server
+	var lastSeenStr, createdAtStr string
+	err = db.QueryRow(`
+		SELECT id, name, ip_address, os, last_seen, created_at, status, cpu_threshold, ram_threshold, disk_threshold
+		FROM servers WHERE id = ?
+	`, id).Scan(&s.ID, &s.Name, &s.IPAddress, &s.OS, &lastSeenStr, &createdAtStr, &s.Status, &s.CPUThreshold, &s.RAMThreshold, &s.DiskThreshold)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload registered server: %w", err)
+	}
+	s.LastSeen, _ = time.Parse(time.RFC3339, lastSeenStr)
+	if s.LastSeen.IsZero() {
+		s.LastSeen, _ = time.Parse("2006-01-02 15:04:05", lastSeenStr)
+	}
+	s.CreatedAt, _ = time.Parse(time.RFC3339, createdAtStr)
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAtStr)
+	}
+	return &s, nil
 }
 
 // SaveMetrics saves agent metrics and triggers threshold alerting checks.
@@ -250,7 +287,7 @@ func SaveMetrics(serverID string, m MetricData) error {
 
 // GetServers retrieves all registered servers and their details.
 func GetServers() ([]Server, error) {
-	rows, err := db.Query("SELECT id, name, ip_address, os, last_seen, created_at, status FROM servers ORDER BY name ASC")
+	rows, err := db.Query("SELECT id, name, ip_address, os, last_seen, created_at, status, cpu_threshold, ram_threshold, disk_threshold FROM servers ORDER BY name ASC")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch servers: %w", err)
 	}
@@ -260,7 +297,7 @@ func GetServers() ([]Server, error) {
 	for rows.Next() {
 		var s Server
 		var lastSeenStr, createdAtStr string
-		if err := rows.Scan(&s.ID, &s.Name, &s.IPAddress, &s.OS, &lastSeenStr, &createdAtStr, &s.Status); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.IPAddress, &s.OS, &lastSeenStr, &createdAtStr, &s.Status, &s.CPUThreshold, &s.RAMThreshold, &s.DiskThreshold); err != nil {
 			return nil, fmt.Errorf("failed to scan server: %w", err)
 		}
 		s.LastSeen, _ = time.Parse(time.RFC3339, lastSeenStr)
@@ -450,4 +487,143 @@ func CheckOfflineServers(thresholdSec float64) ([]string, error) {
 		}
 	}
 	return offlineAlerts, nil
+}
+
+type AgentCommand struct {
+	ID          string     `json:"id"`
+	ServerID    string     `json:"server_id"`
+	CommandType string     `json:"command_type"` // "docker", "process", "diagnostics"
+	Payload     string     `json:"payload"`
+	Status      string     `json:"status"` // "pending", "sent", "success", "failed"
+	Result      *string    `json:"result,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// QueueCommand inserts a new command into the database
+func QueueCommand(serverID, cmdType, payload string) (string, error) {
+	id := fmt.Sprintf("cmd_%d", time.Now().UnixNano())
+	now := time.Now()
+	_, err := db.Exec(`
+		INSERT INTO agent_commands (id, server_id, command_type, payload, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'pending', ?, ?)
+	`, id, serverID, cmdType, payload, now, now)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// GetPendingCommands retrieves pending commands for a server and marks them as 'sent'
+func GetPendingCommands(serverID string) ([]AgentCommand, error) {
+	rows, err := db.Query(`
+		SELECT id, server_id, command_type, payload, status, created_at, updated_at
+		FROM agent_commands
+		WHERE server_id = ? AND status = 'pending'
+	`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []AgentCommand
+	for rows.Next() {
+		var c AgentCommand
+		var createdStr, updatedStr string
+		if err := rows.Scan(&c.ID, &c.ServerID, &c.CommandType, &c.Payload, &c.Status, &createdStr, &updatedStr); err != nil {
+			return nil, err
+		}
+		c.CreatedAt, _ = time.Parse(time.RFC3339, createdStr)
+		if c.CreatedAt.IsZero() {
+			c.CreatedAt, _ = time.Parse("2006-01-02 15:04:05-07:00", createdStr)
+		}
+		if c.CreatedAt.IsZero() {
+			c.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdStr)
+		}
+		c.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
+		if c.UpdatedAt.IsZero() {
+			c.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05-07:00", updatedStr)
+		}
+		if c.UpdatedAt.IsZero() {
+			c.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedStr)
+		}
+		list = append(list, c)
+	}
+
+	// Mark them as sent
+	now := time.Now()
+	for _, c := range list {
+		_, _ = db.Exec(`
+			UPDATE agent_commands
+			SET status = 'sent', updated_at = ?
+			WHERE id = ?
+		`, now, c.ID)
+	}
+
+	return list, nil
+}
+
+// UpdateCommandResult updates the result of a command
+func UpdateCommandResult(cmdID, status, result string) error {
+	now := time.Now()
+	_, err := db.Exec(`
+		UPDATE agent_commands
+		SET status = ?, result = ?, updated_at = ?
+		WHERE id = ?
+	`, status, result, now, cmdID)
+	return err
+}
+
+// GetCommands retrieves historical commands for a server
+func GetCommands(serverID string, limit int) ([]AgentCommand, error) {
+	rows, err := db.Query(`
+		SELECT id, server_id, command_type, payload, status, result, created_at, updated_at
+		FROM agent_commands
+		WHERE server_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, serverID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []AgentCommand
+	for rows.Next() {
+		var c AgentCommand
+		var createdStr, updatedStr string
+		var resVal sql.NullString
+		if err := rows.Scan(&c.ID, &c.ServerID, &c.CommandType, &c.Payload, &c.Status, &resVal, &createdStr, &updatedStr); err != nil {
+			return nil, err
+		}
+		if resVal.Valid {
+			c.Result = &resVal.String
+		}
+		c.CreatedAt, _ = time.Parse(time.RFC3339, createdStr)
+		if c.CreatedAt.IsZero() {
+			c.CreatedAt, _ = time.Parse("2006-01-02 15:04:05-07:00", createdStr)
+		}
+		if c.CreatedAt.IsZero() {
+			c.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdStr)
+		}
+		c.UpdatedAt, _ = time.Parse(time.RFC3339, updatedStr)
+		if c.UpdatedAt.IsZero() {
+			c.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05-07:00", updatedStr)
+		}
+		if c.UpdatedAt.IsZero() {
+			c.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedStr)
+		}
+		list = append(list, c)
+	}
+	return list, nil
+}
+
+// UpdateThresholds modifies CPU, RAM, and Disk thresholds for a server
+func UpdateThresholds(serverID string, cpuTh, ramTh, diskTh float64) error {
+	_, err := db.Exec(`
+		UPDATE servers
+		SET cpu_threshold = ?, ram_threshold = ?, disk_threshold = ?
+		WHERE id = ?
+	`, cpuTh, ramTh, diskTh, serverID)
+	return err
 }

@@ -19,21 +19,25 @@ const (
 
 // checkThresholdAlerts evaluates CPU, RAM, and Disk metrics against thresholds.
 func checkThresholdAlerts(serverID string, m MetricData, now time.Time) {
-	// Retrieve server name for notifications
+	// Retrieve server name and thresholds
 	var serverName string
-	err := db.QueryRow("SELECT name FROM servers WHERE id = ?", serverID).Scan(&serverName)
+	var cpuTh, ramTh, diskTh float64
+	err := db.QueryRow("SELECT name, cpu_threshold, ram_threshold, disk_threshold FROM servers WHERE id = ?", serverID).Scan(&serverName, &cpuTh, &ramTh, &diskTh)
 	if err != nil {
 		serverName = serverID // Fallback to ID
+		cpuTh = defaultCPUThreshold
+		ramTh = defaultRAMThreshold
+		diskTh = defaultDiskThreshold
 	}
 
 	// 1. Check CPU
-	evaluateMetric(serverID, serverName, "cpu", m.CPUUsagePercent, defaultCPUThreshold, now)
+	evaluateMetric(serverID, serverName, "cpu", m.CPUUsagePercent, cpuTh, now)
 
 	// 2. Check RAM
-	evaluateMetric(serverID, serverName, "ram", m.RAM.Percent, defaultRAMThreshold, now)
+	evaluateMetric(serverID, serverName, "ram", m.RAM.Percent, ramTh, now)
 
 	// 3. Check Disk
-	evaluateMetric(serverID, serverName, "disk", m.Disk.Percent, defaultDiskThreshold, now)
+	evaluateMetric(serverID, serverName, "disk", m.Disk.Percent, diskTh, now)
 }
 
 // evaluateMetric checks a single metric against its threshold. If crossed, it triggers an alert.

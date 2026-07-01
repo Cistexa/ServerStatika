@@ -45,13 +45,17 @@ func main() {
 		}
 	}()
 
-	// Register API endpoints using Go 1.22+ routing rules
+		// Register API endpoints using Go 1.22+ routing rules
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/agent/register", handleRegister)
 	mux.HandleFunc("POST /api/agent/metrics", handlePostMetrics)
 	mux.HandleFunc("GET /api/servers", handleGetServers)
 	mux.HandleFunc("GET /api/servers/{id}/metrics", handleGetServerMetrics)
 	mux.HandleFunc("GET /api/alerts", handleGetAlerts)
+	mux.HandleFunc("POST /api/servers/{id}/thresholds", handleUpdateThresholds)
+	mux.HandleFunc("POST /api/servers/{id}/commands", handleQueueCommand)
+	mux.HandleFunc("GET /api/servers/{id}/commands", handleGetCommands)
+	mux.HandleFunc("POST /api/agent/commands/result", handlePostCommandResult)
 
 	// Serve React Frontend SPA
 	mux.Handle("/", serveSPA(frontendFS))
